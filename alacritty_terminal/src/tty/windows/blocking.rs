@@ -60,6 +60,7 @@ impl<R: Read + Send + 'static> UnblockedReader<R> {
         });
 
         // Spawn the reader thread.
+        let notify = interest.clone();
         spawn_named("alacritty-tty-reader-thread", move || {
             let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
             let mut context = Context::from_waker(&waker);
@@ -74,7 +75,19 @@ impl<R: Read + Send + 'static> UnblockedReader<R> {
                     },
 
                     Poll::Ready(Ok(_)) => {
-                        // Keep reading.
+                        // Tell the consumer that data is available.
+                        //
+                        // The waker installed by `poll_drain_bytes` is only armed when
+                        // the consumer drained the pipe empty, but `EventLoop::pty_read`
+                        // deliberately stops after `MAX_LOCKED_READ` bytes so it does not
+                        // hold the terminal lock for too long. It therefore returns to the
+                        // poller regularly with data still buffered and no waker armed.
+                        // Once the pipe fills after that, this thread parks and no further
+                        // write can happen, so nothing remains that could wake the
+                        // consumer: it waits for a notification that only a write could
+                        // produce, the write waits for space that only the consumer could
+                        // free, and the PTY blocks forever.
+                        Wake::wake_by_ref(&notify);
                         continue;
                     },
 
