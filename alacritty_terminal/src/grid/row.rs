@@ -24,6 +24,14 @@ pub struct Row<T> {
     pub(crate) occ: usize,
 }
 
+impl<T: Clone> Row<T> {
+    /// Copy another row's cells into this one, reusing the allocation where it can.
+    pub fn copy_from(&mut self, other: &Row<T>) {
+        self.inner.clone_from(&other.inner);
+        self.occ = other.occ;
+    }
+}
+
 impl<T: PartialEq> PartialEq for Row<T> {
     fn eq(&self, other: &Self) -> bool {
         self.inner == other.inner

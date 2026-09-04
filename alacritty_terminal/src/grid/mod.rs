@@ -160,6 +160,12 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         self.max_scroll_limit = history_size;
     }
 
+    /// Most lines the scrollback can hold; zero on a grid that keeps none.
+    #[inline]
+    pub fn max_scroll_limit(&self) -> usize {
+        self.max_scroll_limit
+    }
+
     pub fn scroll_display(&mut self, scroll: Scroll) {
         self.display_offset = match scroll {
             Scroll::Delta(count) => {
