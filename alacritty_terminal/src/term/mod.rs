@@ -342,11 +342,14 @@ pub struct Term<T> {
 /// the eased frame opens. Only rows that would otherwise be gone are retained; a
 /// full-screen scroll into history is only counted. One region and one direction at a
 /// time: a scroll of another region, or the other way, starts the ledger over, since
-/// that is what a viewer can draw as one strip.
+/// that is what a viewer can draw as one strip. Whole-screen scrolls up are also summed
+/// on their own (`pushed`), so a region scroll after them cannot lose the count of what
+/// went into history.
 #[derive(Debug)]
 pub struct ScrollLedger {
     region: Range<Line>,
     lines: i32,
+    pushed: usize,
     rows: VecDeque<Row<Cell>>,
     spare: Vec<Row<Cell>>,
     cap: usize,
@@ -357,6 +360,7 @@ impl ScrollLedger {
         Self {
             region: Line(0)..Line(0),
             lines: 0,
+            pushed: 0,
             rows: VecDeque::new(),
             spare: Vec::new(),
             cap: 0,
@@ -371,6 +375,13 @@ impl ScrollLedger {
     /// Net lines scrolled; positive when content moved up.
     pub fn lines(&self) -> i32 {
         self.lines
+    }
+
+    /// Lines the whole screen scrolled up since the ledger was last cleared, whatever
+    /// region moved after them. With the scrollback full this is the only count of
+    /// what left the screen.
+    pub fn pushed(&self) -> usize {
+        self.pushed
     }
 
     /// The rows the scrolls pushed out of the region, in screen order.
@@ -388,6 +399,7 @@ impl ScrollLedger {
 
     pub fn clear(&mut self) {
         self.lines = 0;
+        self.pushed = 0;
         self.spare.extend(self.rows.drain(..));
     }
 
@@ -415,8 +427,12 @@ impl ScrollLedger {
         if lines == 0 {
             return;
         }
+        if lines > 0 && region.start == 0 && region.end.0 as usize == grid.screen_lines() {
+            self.pushed += lines as usize;
+        }
         if self.lines == 0 || self.region != *region || (self.lines < 0) != (lines < 0) {
-            self.clear();
+            self.lines = 0;
+            self.spare.extend(self.rows.drain(..));
             self.region = region.clone();
         }
         self.lines += lines;
@@ -3512,5 +3528,30 @@ mod tests {
         term.resize(TermSize::new(6, 4));
         assert!(term.scroll_ledger().is_empty());
         assert!(term.scroll_ledger().rows().is_empty());
+    }
+
+    #[test]
+    fn scroll_ledger_keeps_the_whole_screen_count_through_a_region_scroll() {
+        // A line editor that makes room for its prompt with insert/delete-line right
+        // after the output scrolled the screen: the region churn starts the ledger
+        // over, but what went into history is still summed.
+        let size = TermSize::new(5, 4);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        term.scroll_up(2);
+        assert_eq!(term.scroll_ledger().pushed(), 2);
+        term.goto(1, 0);
+        term.insert_blank_lines(2);
+        term.delete_lines(3);
+        term.insert_blank_lines(3);
+        assert_eq!(term.scroll_ledger().lines(), -3);
+        assert_eq!(term.scroll_ledger().region(), Line(1)..Line(4));
+        assert_eq!(term.scroll_ledger().pushed(), 2);
+        // A scroll region short of the whole screen is not a push.
+        term.scroll_ledger_mut().clear();
+        assert_eq!(term.scroll_ledger().pushed(), 0);
+        term.set_scrolling_region(1, Some(3));
+        term.scroll_up(1);
+        assert_eq!(term.scroll_ledger().pushed(), 0);
+        assert_eq!(term.scroll_ledger().lines(), 1);
     }
 }
