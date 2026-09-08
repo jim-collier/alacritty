@@ -428,14 +428,18 @@ impl ScrollLedger {
             return;
         }
         if lines > 0 && region.start == 0 && region.end.0 as usize == grid.screen_lines() {
-            self.pushed += lines as usize;
+            self.pushed = self.pushed.saturating_add(lines as usize);
         }
         if self.lines == 0 || self.region != *region || (self.lines < 0) != (lines < 0) {
             self.lines = 0;
             self.spare.extend(self.rows.drain(..));
             self.region = region.clone();
         }
-        self.lines += lines;
+        // Saturating, not wrapping: only `Pane::build` drains this, and it runs
+        // for the visible tab's panes only - so a background tab under sustained
+        // output has nobody to clear it. Past a screenful the exact count means
+        // nothing anyway; the consumer clamps to the grid.
+        self.lines = self.lines.saturating_add(lines);
         let Some(lost) = lost.filter(|_| self.cap > 0) else { return };
         let mut keep = |line: Line| {
             let mut row = self.spare.pop().unwrap_or_default();
@@ -3528,6 +3532,27 @@ mod tests {
         term.resize(TermSize::new(6, 4));
         assert!(term.scroll_ledger().is_empty());
         assert!(term.scroll_ledger().rows().is_empty());
+    }
+
+    #[test]
+    fn scroll_ledger_counts_saturate() {
+        // Only the terminal drawing the pane drains this, and it draws the visible
+        // tab. A background tab under sustained output has nobody to clear it, so
+        // both counts have to survive running out of room.
+        let size = TermSize::new(5, 4);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        term.swap_alt(); // no history, so the count is not truncated
+
+        term.scroll_up(1);
+        term.scroll_ledger_mut().lines = i32::MAX - 1;
+        term.scroll_up(2);
+        assert_eq!(term.scroll_ledger().lines(), i32::MAX);
+
+        term.swap_alt();
+        term.scroll_up(1);
+        term.scroll_ledger_mut().pushed = usize::MAX - 1;
+        term.scroll_up(2);
+        assert_eq!(term.scroll_ledger().pushed(), usize::MAX);
     }
 
     #[test]
