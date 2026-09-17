@@ -340,15 +340,23 @@ pub struct Term<T> {
 /// alternate screen, or a scroll region on either screen). The count says how far the
 /// region moved, the region says which rows moved, and the retained rows fill the gap
 /// the eased frame opens. Only rows that would otherwise be gone are retained; a
-/// full-screen scroll into history is only counted. One region and one direction at a
-/// time: a scroll of another region, or the other way, starts the ledger over, since
-/// that is what a viewer can draw as one strip. Whole-screen scrolls up are also summed
-/// on their own (`pushed`), so a region scroll after them cannot lose the count of what
+/// full-screen scroll into history is only counted. One direction at a time: a scroll
+/// the other way starts the ledger over, since that is what a viewer can draw as one
+/// strip. So does a scroll of a region sharing no row with the current one. A scroll of
+/// an overlapping region carries on: the region narrows to the rows both moved, and the
+/// rows kept are those that crossed the narrowed region's edge, whether the grid dropped
+/// them or they merely stopped moving. nano scrolls an edit window whose bottom edge
+/// ncurses extends over the blank status row now and then, and starting over on that
+/// threw the slide in flight away. A reader takes the record with `drain` while its
+/// slide is in flight, which leaves the region and direction open for the next scroll,
+/// and with `clear` once it is at rest. Whole-screen scrolls up are also summed on
+/// their own (`pushed`), so a region scroll after them cannot lose the count of what
 /// went into history.
 #[derive(Debug)]
 pub struct ScrollLedger {
     region: Range<Line>,
     lines: i32,
+    way: i8, // sign of the scrolls being summed; 0 = the next one starts over
     pushed: usize,
     rows: VecDeque<Row<Cell>>,
     spare: Vec<Row<Cell>>,
@@ -360,6 +368,7 @@ impl ScrollLedger {
         Self {
             region: Line(0)..Line(0),
             lines: 0,
+            way: 0,
             pushed: 0,
             rows: VecDeque::new(),
             spare: Vec::new(),
@@ -397,7 +406,16 @@ impl ScrollLedger {
         self.lines == 0
     }
 
+    /// Forget everything: the next scroll starts over whatever its region.
     pub fn clear(&mut self) {
+        self.drain();
+        self.way = 0;
+    }
+
+    /// Take the record but keep the region and direction open, so a scroll of an
+    /// overlapping region the same way carries on from here, narrowing as it goes.
+    /// For a reader whose eased scroll is still in flight.
+    pub fn drain(&mut self) {
         self.lines = 0;
         self.pushed = 0;
         self.spare.extend(self.rows.drain(..));
@@ -415,33 +433,44 @@ impl ScrollLedger {
         }
     }
 
-    /// Record a scroll of `lines` (signed, positive up) within `region`, taking a copy
-    /// of the rows in `lost` first when the grid is about to drop them.
-    fn note(
-        &mut self,
-        grid: &Grid<Cell>,
-        region: &Range<Line>,
-        lines: i32,
-        lost: Option<Range<Line>>,
-    ) {
+    /// Record a scroll of `lines` (signed, positive up) within `region`, before the grid
+    /// moves. `keep` says the rows leaving are worth a copy: they are about to be dropped
+    /// rather than going into history.
+    fn note(&mut self, grid: &Grid<Cell>, region: &Range<Line>, lines: i32, keep: bool) {
         if lines == 0 {
             return;
         }
         if lines > 0 && region.start == 0 && region.end.0 as usize == grid.screen_lines() {
             self.pushed = self.pushed.saturating_add(lines as usize);
         }
-        if self.lines == 0 || self.region != *region || (self.lines < 0) != (lines < 0) {
+        let way = lines.signum() as i8;
+        let overlap = region.start < self.region.end && self.region.start < region.end;
+        if self.way != way || !overlap {
             self.lines = 0;
             self.spare.extend(self.rows.drain(..));
             self.region = region.clone();
+            self.way = way;
         }
+        let had = self.region.clone();
+        self.region = cmp::max(had.start, region.start)..cmp::min(had.end, region.end);
         // Saturating, not wrapping: only `Pane::build` drains this, and it runs
         // for the visible tab's panes only - so a background tab under sustained
         // output has nobody to clear it. Past a screenful the exact count means
         // nothing anyway; the consumer clamps to the grid.
         self.lines = self.lines.saturating_add(lines);
-        let Some(lost) = lost.filter(|_| self.cap > 0) else { return };
-        let mut keep = |line: Line| {
+        if !keep || self.cap == 0 {
+            return;
+        }
+        // The rows crossing the edge the retained rows sit past: what this scroll
+        // carries over it, and any row the region gave up at that edge, which stops
+        // moving where it is. On an unchanged region that is just the rows leaving.
+        let count = lines.unsigned_abs() as usize;
+        let crossing = if lines > 0 {
+            had.start..cmp::min(self.region.start + count, region.end)
+        } else {
+            cmp::max(self.region.end - count, region.start)..had.end
+        };
+        let mut retain = |line: Line| {
             let mut row = self.spare.pop().unwrap_or_default();
             row.copy_from(&grid[line]);
             if lines > 0 {
@@ -451,9 +480,9 @@ impl ScrollLedger {
             }
         };
         if lines > 0 {
-            (lost.start.0..lost.end.0).map(Line::from).for_each(&mut keep);
+            (crossing.start.0..crossing.end.0).map(Line::from).for_each(&mut retain);
         } else {
-            (lost.start.0..lost.end.0).rev().map(Line::from).for_each(&mut keep);
+            (crossing.start.0..crossing.end.0).rev().map(Line::from).for_each(&mut retain);
         }
         self.trim();
     }
@@ -908,8 +937,7 @@ impl<T> Term<T> {
         }
 
         // Scroll between origin and bottom
-        let lost = region.end - lines..region.end;
-        self.scroll_ledger.note(&self.grid, &region, -(lines as i32), Some(lost));
+        self.scroll_ledger.note(&self.grid, &region, -(lines as i32), true);
         self.grid.scroll_down(&region, lines);
         self.mark_fully_damaged();
     }
@@ -931,11 +959,8 @@ impl<T> Term<T> {
 
         // Rows leaving a region below the top, or any grid without history, are gone
         // for good; the rest go into the scrollback and are only counted.
-        let lost = (region.start != 0 || self.grid.max_scroll_limit() == 0).then(|| {
-            let len = (region.end - region.start).0 as usize;
-            region.start..region.start + cmp::min(lines, len)
-        });
-        self.scroll_ledger.note(&self.grid, &region, lines as i32, lost);
+        let keep = region.start != 0 || self.grid.max_scroll_limit() == 0;
+        self.scroll_ledger.note(&self.grid, &region, lines as i32, keep);
         self.grid.scroll_up(&region, lines);
 
         // Scroll vi mode cursor.
@@ -3509,7 +3534,8 @@ mod tests {
         assert_eq!(term.scroll_ledger().lines(), -3);
         assert_eq!(label(&term), ['z', 'x', 'y']);
 
-        // So does another region, and a deleted line's region starts at the cursor.
+        // A region scroll the other way starts over too, and a deleted line's region
+        // starts at the cursor.
         mark(&mut term, &['p', 'q', 'r', 's']);
         term.set_scrolling_region(2, Some(3));
         term.scroll_up(1);
@@ -3520,8 +3546,22 @@ mod tests {
         mark(&mut term, &['p', 'q', 'r', 's']);
         term.goto(2, 0);
         term.delete_lines(1);
-        assert_eq!(term.scroll_ledger().region(), Line(2)..Line(4));
-        assert_eq!(label(&term), ['r']);
+        // Until the overlap rule, a region change of any kind started over:
+        //   assert_eq!(term.scroll_ledger().region(), Line(2)..Line(4));
+        //   assert_eq!(label(&term), ['r']);
+        // Now a region sharing rows with the current one carries on, narrowed to the
+        // rows both moved, and the row it gave up at the edge rides along.
+        assert_eq!(term.scroll_ledger().lines(), 2);
+        assert_eq!(term.scroll_ledger().region(), Line(2)..Line(3));
+        assert_eq!(label(&term), ['q', 'q', 'r']);
+        // A region sharing no row with it does start over.
+        term.set_scrolling_region(1, Some(2));
+        mark(&mut term, &['p', 'q', 'r', 's']);
+        term.scroll_up(1);
+        assert_eq!(term.scroll_ledger().lines(), 1);
+        assert_eq!(term.scroll_ledger().region(), Line(0)..Line(2));
+        assert_eq!(label(&term), ['p']);
+        term.set_scrolling_region(1, None);
 
         // A region scroll on the primary screen keeps its rows too, and a resize forgets everything.
         term.swap_alt();
@@ -3532,6 +3572,86 @@ mod tests {
         term.resize(TermSize::new(6, 4));
         assert!(term.scroll_ledger().is_empty());
         assert!(term.scroll_ledger().rows().is_empty());
+    }
+
+    #[test]
+    fn scroll_ledger_carries_on_across_an_overlapping_region() {
+        // nano scrolling up: ncurses scrolls the edit window, and every so often the
+        // blank status row under it as well. The ledger keeps counting on the rows
+        // both scrolls moved, and the row that crosses that region's bottom edge is
+        // retained even though the grid still holds it.
+        let size = TermSize::new(5, 6);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let label = |term: &Term<VoidListener>| -> Vec<char> {
+            term.scroll_ledger().rows().iter().map(|r| r[Column(0)].c).collect()
+        };
+        let mark = |term: &mut Term<VoidListener>, chars: &[char]| {
+            for (i, ch) in chars.iter().enumerate() {
+                term.grid[Line(i as i32)][Column(0)].c = *ch;
+            }
+        };
+        term.swap_alt();
+        term.set_scroll_ledger_rows(8);
+
+        mark(&mut term, &['a', 'b', 'c', 'd', 'e', 'f']);
+        term.set_scrolling_region(2, Some(4));
+        term.scroll_down(1);
+        assert_eq!(label(&term), ['d']);
+        // the odd step: one row further down, the same way
+        term.set_scrolling_region(2, Some(5));
+        term.scroll_down(1);
+        assert_eq!(term.scroll_ledger().lines(), -2);
+        assert_eq!(term.scroll_ledger().region(), Line(1)..Line(4));
+        assert_eq!(label(&term), ['c', 'd'], "the row that crossed row 4, not the one dropped");
+        assert_eq!(term.grid[Line(4)][Column(0)].c, 'c');
+        term.set_scrolling_region(2, Some(4));
+        term.scroll_down(1);
+        assert_eq!(term.scroll_ledger().lines(), -3);
+        assert_eq!(term.scroll_ledger().region(), Line(1)..Line(4));
+        assert_eq!(label(&term), ['b', 'c', 'd']);
+        // A reader still easing takes the record with `drain`, and the next scroll
+        // carries on from the narrowed region; after `clear` a region is taken whole.
+        term.scroll_ledger_mut().drain();
+        mark(&mut term, &['a', 'b', 'c', 'd', 'e', 'f']);
+        term.set_scrolling_region(2, Some(5));
+        term.scroll_down(1);
+        assert_eq!(term.scroll_ledger().lines(), -1);
+        assert_eq!(term.scroll_ledger().region(), Line(1)..Line(4));
+        assert_eq!(label(&term), ['d']);
+        term.scroll_ledger_mut().clear();
+        mark(&mut term, &['a', 'b', 'c', 'd', 'e', 'f']);
+        term.scroll_down(1);
+        assert_eq!(term.scroll_ledger().region(), Line(1)..Line(5));
+        assert_eq!(label(&term), ['e']);
+
+        // The region giving up rows at that edge: they stop moving, so they join the
+        // retained rows after the one that left, in screen order.
+        term.scroll_ledger_mut().clear();
+        mark(&mut term, &['p', 'q', 'r', 's', 't', 'u']);
+        term.set_scrolling_region(2, Some(5));
+        term.scroll_down(1);
+        term.set_scrolling_region(2, Some(4));
+        term.scroll_down(1);
+        assert_eq!(term.scroll_ledger().lines(), -2);
+        assert_eq!(term.scroll_ledger().region(), Line(1)..Line(4));
+        assert_eq!(label(&term), ['r', 's', 't']);
+
+        // The same the other way, where the edge is the region's top.
+        term.scroll_ledger_mut().clear();
+        mark(&mut term, &['p', 'q', 'r', 's', 't', 'u']);
+        term.set_scrolling_region(3, Some(5));
+        term.scroll_up(1);
+        assert_eq!(label(&term), ['r']);
+        term.set_scrolling_region(2, Some(5));
+        term.scroll_up(1);
+        assert_eq!(term.scroll_ledger().lines(), 2);
+        assert_eq!(term.scroll_ledger().region(), Line(2)..Line(5));
+        assert_eq!(label(&term), ['r', 's']);
+        term.set_scrolling_region(4, Some(5));
+        term.scroll_up(1);
+        assert_eq!(term.scroll_ledger().lines(), 3);
+        assert_eq!(term.scroll_ledger().region(), Line(3)..Line(5));
+        assert_eq!(label(&term), ['r', 's', 't', ' ']);
     }
 
     #[test]
