@@ -42,6 +42,10 @@ pub const MIN_SCREEN_LINES: usize = 1;
 /// Max size of the window title stack.
 const TITLE_STACK_MAX_DEPTH: usize = 4096;
 
+/// Max bytes kept of a title. Every entry on the title stack is a copy of one, so without this a
+/// program could make the stack hold as much memory as it liked.
+const TITLE_MAX_BYTES: usize = 2048;
+
 /// Default semantic escape characters.
 pub const SEMANTIC_ESCAPE_CHARS: &str = ",│`|:\"' ()[]{}<>\t";
 
@@ -2404,6 +2408,19 @@ impl<T: EventListener> Handler for Term<T> {
 
     #[inline]
     fn set_title(&mut self, title: Option<String>) {
+        let title = title.map(|mut title| {
+            if title.len() > TITLE_MAX_BYTES {
+                let mut end = TITLE_MAX_BYTES;
+                while !title.is_char_boundary(end) {
+                    end -= 1;
+                }
+                title.truncate(end);
+                // the title also goes out in an event, so give back what was cut
+                title.shrink_to_fit();
+            }
+            title
+        });
+
         trace!("Setting title to '{title:?}'");
 
         self.title.clone_from(&title);
@@ -3474,6 +3491,33 @@ mod tests {
         term.title = Some("Test".into());
         term.set_title(None);
         assert_eq!(term.title, None);
+    }
+
+    #[test]
+    fn title_is_capped() {
+        let size = TermSize::new(7, 17);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+
+        // Long titles are cut short.
+        term.set_title(Some("x".repeat(1 << 20)));
+        assert_eq!(term.title.as_ref().unwrap().len(), TITLE_MAX_BYTES);
+
+        // The cut never splits a character.
+        term.set_title(Some(format!("x{}", "\u{4e2d}".repeat(TITLE_MAX_BYTES))));
+        let title = term.title.as_ref().unwrap();
+        assert!(title.len() <= TITLE_MAX_BYTES && title.len() > TITLE_MAX_BYTES - 4);
+        assert!(title.ends_with('\u{4e2d}'));
+
+        // So a stack of them is held to a known size.
+        for _ in 0..TITLE_STACK_MAX_DEPTH {
+            term.push_title();
+        }
+        let held: usize = term.title_stack.iter().flatten().map(String::capacity).sum();
+        assert!(held <= TITLE_STACK_MAX_DEPTH * TITLE_MAX_BYTES);
+
+        // Ordinary titles are left alone.
+        term.set_title(Some("~/src".into()));
+        assert_eq!(term.title, Some("~/src".into()));
     }
 
     #[test]
