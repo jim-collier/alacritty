@@ -26,6 +26,10 @@ pub(crate) const READ_BUFFER_SIZE: usize = 0x10_0000;
 /// Max bytes to read from the PTY while the terminal is locked.
 const MAX_LOCKED_READ: usize = u16::MAX as usize;
 
+/// How long a hung-up PTY is left alone before it is polled again.
+#[cfg(target_os = "linux")]
+const HANGUP_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Messages that may be sent to the `EventLoop`.
 #[derive(Debug)]
 pub enum Msg {
@@ -83,6 +87,18 @@ where
 
     pub fn channel(&self) -> EventLoopSender {
         EventLoopSender { sender: self.tx.clone(), poller: self.poll.clone() }
+    }
+
+    /// A hung-up PTY keeps reporting the hang-up and stays readable, so a child that closed its
+    /// terminal and kept running would spin the loop until it exited. Leave the PTY out of the
+    /// poll for a moment instead: a oneshot registration with no interest reports at most one
+    /// more event and then nothing until it is registered again.
+    #[cfg(target_os = "linux")]
+    fn pause_hung_up(&mut self, until: &mut Option<Instant>) {
+        if until.is_none() {
+            self.pty.reregister(&self.poll, PollingEvent::none(0), PollMode::Oneshot).unwrap();
+            *until = Some(Instant::now() + HANGUP_PAUSE);
+        }
     }
 
     /// Drain the channel.
@@ -224,11 +240,18 @@ where
                 None
             };
 
+            // Set while a hung-up PTY is left out of the poll.
+            let mut hangup_until: Option<Instant> = None;
+
             'event_loop: loop {
                 // Wakeup the event loop when a synchronized update timeout was reached.
                 let handler = state.parser.sync_timeout();
-                let timeout =
-                    handler.sync_timeout().map(|st| st.saturating_duration_since(Instant::now()));
+                let sync_at = handler.sync_timeout();
+                let mut timeout = sync_at.map(|st| st.saturating_duration_since(Instant::now()));
+                if let Some(until) = hangup_until {
+                    let left = until.saturating_duration_since(Instant::now());
+                    timeout = Some(timeout.map_or(left, |t| t.min(left)));
+                }
 
                 events.clear();
                 if let Err(err) = self.poll.wait(&mut events, timeout) {
@@ -238,6 +261,20 @@ where
                             error!("Event loop polling error: {err}");
                             break 'event_loop;
                         },
+                    }
+                }
+
+                // Poll the PTY again once the pause is over, in case the client side was
+                // opened again.
+                if hangup_until.is_some_and(|until| Instant::now() >= until) {
+                    hangup_until = None;
+                    interest.writable = state.needs_write();
+                    self.pty.reregister(&self.poll, interest, poll_opts).unwrap();
+                    if events.is_empty()
+                        && self.rx.peek().is_none()
+                        && sync_at.is_none_or(|at| Instant::now() < at)
+                    {
+                        continue;
                     }
                 }
 
@@ -273,6 +310,16 @@ where
 
                         tty::PTY_READ_WRITE_TOKEN => {
                             if event.is_interrupt() {
+                                // A child that opens its terminal again can write and close it
+                                // within one pause, and what it wrote is still there to read.
+                                #[cfg(target_os = "linux")]
+                                {
+                                    if event.readable {
+                                        let _ = self.pty_read(&mut state, &mut buf, pipe.as_mut());
+                                    }
+                                    self.pause_hung_up(&mut hangup_until);
+                                }
+
                                 // Don't try to do I/O on a dead PTY.
                                 continue;
                             }
@@ -287,6 +334,7 @@ where
                                     // blocking.
                                     #[cfg(target_os = "linux")]
                                     if err.raw_os_error() == Some(libc::EIO) {
+                                        self.pause_hung_up(&mut hangup_until);
                                         continue;
                                     }
 
@@ -308,7 +356,7 @@ where
 
                 // Register write interest if necessary.
                 let needs_write = state.needs_write();
-                if needs_write != interest.writable {
+                if needs_write != interest.writable && hangup_until.is_none() {
                     interest.writable = needs_write;
 
                     // Re-register with new interest.
