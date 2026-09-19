@@ -353,9 +353,9 @@ pub struct Term<T> {
 /// ncurses extends over the blank status row now and then, and starting over on that
 /// threw the slide in flight away. A reader takes the record with `drain` while its
 /// slide is in flight, which leaves the region and direction open for the next scroll,
-/// and with `clear` once it is at rest. Whole-screen scrolls up are also summed on
-/// their own (`pushed`), so a region scroll after them cannot lose the count of what
-/// went into history.
+/// and with `clear` once it is at rest. Lines sent off the top of the screen toward
+/// history are also summed on their own (`pushed`), so a region scroll after them
+/// cannot lose the count of what went into history.
 #[derive(Debug)]
 pub struct ScrollLedger {
     region: Range<Line>,
@@ -390,9 +390,10 @@ impl ScrollLedger {
         self.lines
     }
 
-    /// Lines the whole screen scrolled up since the ledger was last cleared, whatever
-    /// region moved after them. With the scrollback full this is the only count of
-    /// what left the screen.
+    /// Lines sent off the top of the screen since the ledger was last cleared, whatever
+    /// region moved after them: whole-screen scrolls, scrolls of a region at the top of
+    /// a grid with history (a status line pinned under it), and a screen clear's push.
+    /// With the scrollback full this is the only count of what left the screen.
     pub fn pushed(&self) -> usize {
         self.pushed
     }
@@ -437,14 +438,20 @@ impl ScrollLedger {
         }
     }
 
+    /// Count lines a screen clear sent toward history, which no scroll records.
+    fn note_pushed(&mut self, lines: usize) {
+        self.pushed = self.pushed.saturating_add(lines);
+    }
+
     /// Record a scroll of `lines` (signed, positive up) within `region`, before the grid
-    /// moves. `keep` says the rows leaving are worth a copy: they are about to be dropped
+    /// moves. `keep` says the rows leaving are worth keeping: they are about to be dropped
     /// rather than going into history.
-    fn note(&mut self, grid: &Grid<Cell>, region: &Range<Line>, lines: i32, keep: bool) {
+    fn note(&mut self, grid: &mut Grid<Cell>, region: &Range<Line>, lines: i32, keep: bool) {
         if lines == 0 {
             return;
         }
-        if lines > 0 && region.start == 0 && region.end.0 as usize == grid.screen_lines() {
+        let whole = region.start == 0 && region.end.0 as usize == grid.screen_lines();
+        if lines > 0 && region.start == 0 && (whole || !keep) {
             self.pushed = self.pushed.saturating_add(lines as usize);
         }
         let way = lines.signum() as i8;
@@ -474,9 +481,26 @@ impl ScrollLedger {
         } else {
             cmp::max(self.region.end - count, region.start)..had.end
         };
+        // A row the grid is about to drop is taken, with a spare left in its place for
+        // the grid to reset as it would have reset the row. A copy per scrolled line cost
+        // a full-screen program a third of its parse speed. A row that only stops moving
+        // stays in the grid and has to be copied.
+        let dropped = if lines > 0 {
+            region.start..cmp::min(region.start + count, region.end)
+        } else {
+            cmp::max(region.end - count, region.start)..region.end
+        };
+        let columns = grid.columns();
         let mut retain = |line: Line| {
             let mut row = self.spare.pop().unwrap_or_default();
-            row.copy_from(&grid[line]);
+            if dropped.contains(&line) {
+                if row.len() != columns {
+                    row = Row::new(columns);
+                }
+                mem::swap(&mut grid[line], &mut row);
+            } else {
+                row.copy_from(&grid[line]);
+            }
             if lines > 0 {
                 self.rows.push_back(row);
             } else {
@@ -941,7 +965,7 @@ impl<T> Term<T> {
         }
 
         // Scroll between origin and bottom
-        self.scroll_ledger.note(&self.grid, &region, -(lines as i32), true);
+        self.scroll_ledger.note(&mut self.grid, &region, -(lines as i32), true);
         self.grid.scroll_down(&region, lines);
         self.mark_fully_damaged();
     }
@@ -964,7 +988,7 @@ impl<T> Term<T> {
         // Rows leaving a region below the top, or any grid without history, are gone
         // for good; the rest go into the scrollback and are only counted.
         let keep = region.start != 0 || self.grid.max_scroll_limit() == 0;
-        self.scroll_ledger.note(&self.grid, &region, lines as i32, keep);
+        self.scroll_ledger.note(&mut self.grid, &region, lines as i32, keep);
         self.grid.scroll_up(&region, lines);
 
         // Scroll vi mode cursor.
@@ -1979,7 +2003,8 @@ impl<T: EventListener> Handler for Term<T> {
                 } else {
                     let old_offset = self.grid.display_offset();
 
-                    self.grid.clear_viewport();
+                    let pushed = self.grid.clear_viewport();
+                    self.scroll_ledger.note_pushed(pushed);
 
                     // Compute number of lines scrolled by clearing the viewport.
                     let lines = self.grid.display_offset().saturating_sub(old_offset);
@@ -3735,12 +3760,196 @@ mod tests {
         assert_eq!(term.scroll_ledger().lines(), -3);
         assert_eq!(term.scroll_ledger().region(), Line(1)..Line(4));
         assert_eq!(term.scroll_ledger().pushed(), 2);
-        // A scroll region short of the whole screen is not a push.
+        // A region at the top of a grid with history sends its rows there as well, so
+        // it is a push. This read 0 until the count followed the grid's own rule:
+        //   assert_eq!(term.scroll_ledger().pushed(), 0);
         term.scroll_ledger_mut().clear();
         assert_eq!(term.scroll_ledger().pushed(), 0);
         term.set_scrolling_region(1, Some(3));
         term.scroll_up(1);
+        assert_eq!(term.scroll_ledger().pushed(), 1);
+        assert_eq!(term.scroll_ledger().lines(), 1);
+        // A region below the top is not.
+        term.scroll_ledger_mut().clear();
+        term.set_scrolling_region(2, Some(4));
+        term.scroll_up(1);
         assert_eq!(term.scroll_ledger().pushed(), 0);
         assert_eq!(term.scroll_ledger().lines(), 1);
+    }
+
+    #[test]
+    fn scroll_ledger_counts_a_pinned_status_line_at_a_full_scrollback() {
+        // apt's progress bar: a region over all but the last row. Each line feed at
+        // its bottom sends a row into history, and with the history full the depth
+        // no longer says so.
+        let size = TermSize::new(20, 8);
+        let config = Config { scrolling_history: 5, ..Config::default() };
+        let mut term = Term::new(config, &size, VoidListener);
+        term.scroll_up(9);
+        assert_eq!(term.grid().history_size(), 5);
+        term.scroll_ledger_mut().clear();
+
+        term.set_scrolling_region(1, Some(7));
+        term.goto(6, 0);
+        term.linefeed();
+        assert_eq!(term.grid().history_size(), 5);
+        assert_eq!(term.scroll_ledger().pushed(), 1);
+        assert_eq!(term.scroll_ledger().region(), Line(0)..Line(7));
+
+        // Delete-line at the region's top row and a clear of the screen push too.
+        term.goto(0, 0);
+        term.delete_lines(2);
+        assert_eq!(term.scroll_ledger().pushed(), 3);
+        term.scroll_ledger_mut().clear();
+        term.grid[Line(3)][Column(0)].c = 'x';
+        term.clear_screen(ansi::ClearMode::All);
+        assert_eq!(term.scroll_ledger().pushed(), 4);
+    }
+
+    #[test]
+    fn scroll_ledger_takes_a_dropped_row_rather_than_copying_it() {
+        let size = TermSize::new(6, 4);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        term.swap_alt();
+        term.set_scroll_ledger_rows(2);
+        let mark = |term: &mut Term<VoidListener>, chars: &[char]| {
+            for (i, ch) in chars.iter().enumerate() {
+                term.grid[Line(i as i32)][Column(0)].c = *ch;
+            }
+        };
+        let screen = |term: &Term<VoidListener>| -> Vec<char> {
+            (0..4).map(|i| term.grid[Line(i)][Column(0)].c).collect()
+        };
+        mark(&mut term, &['p', 'q', 'r', 's']);
+        let leaving: *const Cell = &term.grid[Line(0)][Column(0)];
+        term.scroll_up(1);
+        let kept: *const Cell = &term.scroll_ledger().rows()[0][Column(0)];
+        assert_eq!(kept, leaving, "the row itself is kept, not a copy of it");
+        assert_eq!(term.scroll_ledger().rows()[0][Column(0)].c, 'p');
+        assert_eq!(screen(&term), ['q', 'r', 's', ' ']);
+
+        // Rows trimmed past the cap come back as the spares left in the grid, and
+        // the grid resets those like any row it scrolled away.
+        mark(&mut term, &['a', 'b', 'c', 'd']);
+        term.scroll_up(3);
+        assert_eq!(term.scroll_ledger().rows().len(), 2);
+        assert_eq!(screen(&term), ['d', ' ', ' ', ' ']);
+        term.scroll_down(2);
+        assert_eq!(screen(&term), [' ', ' ', 'd', ' ']);
+
+        // A spare from before a resize is the wrong width for the grid.
+        term.resize(TermSize::new(9, 4));
+        mark(&mut term, &['a', 'b', 'c', 'd']);
+        term.scroll_up(2);
+        assert_eq!(term.scroll_ledger().rows().len(), 2);
+        for i in 0..4 {
+            assert_eq!(term.grid[Line(i)].len(), 9);
+        }
+        assert_eq!(screen(&term), ['c', 'd', ' ', ' ']);
+    }
+
+    #[test]
+    fn scroll_ledger_matches_what_the_grid_did() {
+        // Three terminals in step through random scrolls: `big` never fills its
+        // history and keeps rows, `full` has a history that is full from the start,
+        // and `bare` keeps no rows. The push count has to be the history's growth
+        // in `big` and the same in `full`, the kept rows have to be the rows that
+        // left for good, and keeping them may not change any screen.
+        const LINES: i32 = 8;
+        let size = TermSize::new(4, LINES as usize);
+        let config = |history| Config { scrolling_history: history, ..Config::default() };
+        let mut big = Term::new(config(100_000), &size, VoidListener);
+        let mut full = Term::new(config(5), &size, VoidListener);
+        let mut bare = Term::new(config(100_000), &size, VoidListener);
+        big.set_scroll_ledger_rows(3);
+        full.set_scroll_ledger_rows(3);
+        full.scroll_up(9);
+
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 33) as usize % below
+        };
+        let screen = |term: &Term<VoidListener>| -> Vec<Row<Cell>> {
+            (0..LINES).map(|i| term.grid[Line(i)].clone()).collect()
+        };
+
+        let mut label = 0u32;
+        for step in 0..20_000 {
+            let op = next(12);
+            let (a, b) = (next(LINES as usize), next(LINES as usize));
+            let count = 1 + next(LINES as usize + 2);
+            label += 1;
+            let ch = char::from_u32('a' as u32 + label % 26).unwrap();
+
+            let before = screen(&big);
+            let alt = big.mode().contains(TermMode::ALT_SCREEN);
+            let history = big.grid().history_size();
+            for term in [&mut big, &mut full, &mut bare] {
+                term.scroll_ledger_mut().clear();
+                match op {
+                    0 => {
+                        let (top, bottom) = (a.min(b), a.max(b));
+                        term.set_scrolling_region(top + 1, Some(bottom + 1));
+                    },
+                    1 => term.set_scrolling_region(1, Some(a + 1)),
+                    2 => term.set_scrolling_region(1, None),
+                    3 => term.swap_alt(),
+                    4 => term.clear_screen(ansi::ClearMode::All),
+                    5 => term.scroll_up(count),
+                    6 => term.scroll_down(count),
+                    7 => {
+                        term.goto(a as i32, 0);
+                        term.insert_blank_lines(count);
+                    },
+                    8 => {
+                        term.goto(a as i32, 0);
+                        term.delete_lines(count);
+                    },
+                    9 => {
+                        term.goto(a as i32, 0);
+                        term.reverse_index();
+                    },
+                    _ => {
+                        term.goto(a as i32, 0);
+                        term.linefeed();
+                        term.input(ch);
+                    },
+                }
+            }
+
+            let at = format!("step {step}, op {op}");
+            assert_eq!(screen(&big), screen(&full), "{at}");
+            assert_eq!(screen(&big), screen(&bare), "{at}");
+            if op == 3 {
+                continue;
+            }
+
+            let ledger = big.scroll_ledger();
+            assert_eq!(ledger.pushed(), full.scroll_ledger().pushed(), "{at}");
+            if !alt {
+                let grew = big.grid().history_size() - history;
+                assert_eq!(ledger.pushed(), grew, "{at}");
+            }
+
+            // The rows a scroll drops for good, nearest the region last trimmed.
+            let region = ledger.region();
+            let moved = ledger.lines().unsigned_abs() as usize;
+            let mut left: Vec<Row<Cell>> = Vec::new();
+            if ledger.lines() > 0 && (alt || region.start != 0) {
+                let end = cmp::min(region.start.0 as usize + moved, region.end.0 as usize);
+                left.extend_from_slice(&before[region.start.0 as usize..end]);
+                left.drain(..left.len().saturating_sub(3));
+            } else if ledger.lines() < 0 {
+                let start = cmp::max(region.end.0 as usize - moved.min(8), region.start.0 as usize);
+                left.extend_from_slice(&before[start..region.end.0 as usize]);
+                left.truncate(3);
+            }
+            let kept: Vec<Row<Cell>> = ledger.rows().iter().cloned().collect();
+            assert_eq!(kept, left, "{at}");
+            assert!(bare.scroll_ledger().rows().is_empty());
+        }
     }
 }
