@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::{Error, Result};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::IntoRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::{mem, ptr};
 
 use windows_sys::Win32::Foundation::{HANDLE, S_OK};
@@ -118,16 +118,18 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     let (conout, conout_pty_handle) = miow::pipe::anonymous(0)?;
     let (conin_pty_handle, conin) = miow::pipe::anonymous(0)?;
 
-    // Create the Pseudo Console, using the pipes.
+    // Create the Pseudo Console, using the pipes. It takes copies of the two
+    // ends it is handed, so ours are dropped here rather than kept for good.
     let result = unsafe {
         (api.create)(
             window_size.into(),
-            conin_pty_handle.into_raw_handle() as HANDLE,
-            conout_pty_handle.into_raw_handle() as HANDLE,
+            conin_pty_handle.as_raw_handle() as HANDLE,
+            conout_pty_handle.as_raw_handle() as HANDLE,
             0,
             &mut pty_handle as *mut _,
         )
     };
+    drop((conin_pty_handle, conout_pty_handle));
 
     assert_eq!(result, S_OK);
 
@@ -233,14 +235,23 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
             return Err(Error::last_os_error());
         }
     }
+    // Both handles are the caller's to close. Nothing uses the thread's, and
+    // the pane owns the process's, so neither outlives it.
+    // SAFETY: CreateProcessW succeeded, so both are open and ours alone.
+    let (child, _thread) = unsafe {
+        (
+            OwnedHandle::from_raw_handle(proc_info.hProcess),
+            OwnedHandle::from_raw_handle(proc_info.hThread),
+        )
+    };
 
     let conin = UnblockedWriter::new(conin, PIPE_CAPACITY);
     let conout = UnblockedReader::new(conout, PIPE_CAPACITY);
 
-    let child_watcher = ChildExitWatcher::new(proc_info.hProcess)?;
+    let child_watcher = ChildExitWatcher::new(child.as_raw_handle() as HANDLE)?;
     let conpty = Conpty { handle: pty_handle as HPCON, api };
 
-    Ok(Pty::new(conpty, conout, conin, child_watcher))
+    Ok(Pty::new(conpty, conout, conin, child_watcher, child))
 }
 
 // Windows environment variables are case-insensitive, and the caller is responsible for

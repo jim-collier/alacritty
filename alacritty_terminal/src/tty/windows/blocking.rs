@@ -287,3 +287,43 @@ impl Wake for Registration {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    struct Endless;
+
+    impl Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            buf.fill(b'x');
+            Ok(buf.len())
+        }
+    }
+
+    // A read as big as the pipe empties it without ever finding it empty, so
+    // the pipe's own waker is never armed, which is how `EventLoop::pty_read`
+    // ends a round. Only the reader thread's word after each fill wakes the
+    // consumer again. Without it a long run of output froze the pane for good.
+    #[test]
+    fn a_drained_pipe_says_when_it_fills_again() {
+        const CAPACITY: usize = 1 << 20;
+        let poller = Arc::new(Poller::new().unwrap());
+        let mut reader = UnblockedReader::new(Endless, CAPACITY);
+        reader.register(&poller, Event::readable(7), PollMode::Level);
+        let mut buf = vec![0u8; CAPACITY];
+        let mut events = polling::Events::new();
+        let mut total = 0;
+        for round in 0..64 {
+            events.clear();
+            poller.wait(&mut events, Some(Duration::from_secs(3))).unwrap();
+            assert!(!events.is_empty(), "no notice for 3 s after {total} bytes in {round} rounds");
+            if round % 2 == 1 {
+                thread::sleep(Duration::from_millis(5));
+            }
+            total += reader.try_read(&mut buf);
+        }
+    }
+}

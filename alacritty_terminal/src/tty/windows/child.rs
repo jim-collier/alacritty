@@ -10,9 +10,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use polling::os::iocp::{CompletionPacket, PollerIocpExt};
 use polling::{Event, Poller};
 
-use windows_sys::Win32::Foundation::{BOOLEAN, FALSE, HANDLE};
+use windows_sys::Win32::Foundation::{BOOLEAN, FALSE, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, GetProcessId, INFINITE, RegisterWaitForSingleObject, UnregisterWait,
+    GetExitCodeProcess, GetProcessId, INFINITE, RegisterWaitForSingleObject, UnregisterWaitEx,
     WT_EXECUTEINWAITTHREAD, WT_EXECUTEONLYONCE,
 };
 
@@ -126,8 +126,13 @@ impl ChildExitWatcher {
 
 impl Drop for ChildExitWatcher {
     fn drop(&mut self) {
+        // Wait out a callback already running, since it reads the process
+        // handle, which the owner closes once this is gone.
         unsafe {
-            UnregisterWait(self.wait_handle.load(Ordering::Relaxed) as HANDLE);
+            UnregisterWaitEx(
+                self.wait_handle.load(Ordering::Relaxed) as HANDLE,
+                INVALID_HANDLE_VALUE,
+            );
         }
     }
 }
