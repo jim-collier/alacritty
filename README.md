@@ -1,3 +1,5 @@
+Note: This fork is used by [SilkTerm](https://github.com/yottacore/silkterm) for its core terminal plumbing. (Rather than reinventing that thoroughly invented wheel ourselves.) Our necessary patches are submitted for the upstream project to accept or not, and we pull upstream changes when necessary.
+
 <p align="center">
     <img width="200" alt="Alacritty Logo" src="https://raw.githubusercontent.com/alacritty/alacritty/master/extra/logo/compat/alacritty-term%2Bscanlines.png">
 </p>
