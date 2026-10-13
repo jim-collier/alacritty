@@ -355,13 +355,15 @@ pub struct Term<T> {
 /// slide is in flight, which leaves the region and direction open for the next scroll,
 /// and with `clear` once it is at rest. Lines sent off the top of the screen toward
 /// history are also summed on their own (`pushed`), so a region scroll after them
-/// cannot lose the count of what went into history.
+/// cannot lose the count of what went into history. A screen clear is noted too, with
+/// the lines pushed after it (`since_clear`), for a viewer that shows a clear at once.
 #[derive(Debug)]
 pub struct ScrollLedger {
     region: Range<Line>,
     lines: i32,
     way: i8, // sign of the scrolls being summed; 0 = the next one starts over
     pushed: usize,
+    since_clear: Option<usize>,
     rows: VecDeque<Row<Cell>>,
     spare: Vec<Row<Cell>>,
     cap: usize,
@@ -374,6 +376,7 @@ impl ScrollLedger {
             lines: 0,
             way: 0,
             pushed: 0,
+            since_clear: None,
             rows: VecDeque::new(),
             spare: Vec::new(),
             cap: 0,
@@ -396,6 +399,14 @@ impl ScrollLedger {
     /// With the scrollback full this is the only count of what left the screen.
     pub fn pushed(&self) -> usize {
         self.pushed
+    }
+
+    /// Lines sent off the top of the screen since the last screen clear in the record,
+    /// or `None` when there was no clear. An erase of the whole display or a reset
+    /// counts; erasing only the scrollback does not, since the screen stays as it was.
+    /// The clear's own push is in [`Self::pushed`] and not here.
+    pub fn since_clear(&self) -> Option<usize> {
+        self.since_clear
     }
 
     /// The rows the scrolls pushed out of the region, in screen order.
@@ -423,6 +434,7 @@ impl ScrollLedger {
     pub fn drain(&mut self) {
         self.lines = 0;
         self.pushed = 0;
+        self.since_clear = None;
         self.spare.extend(self.rows.drain(..));
     }
 
@@ -438,9 +450,10 @@ impl ScrollLedger {
         }
     }
 
-    /// Count lines a screen clear sent toward history, which no scroll records.
-    fn note_pushed(&mut self, lines: usize) {
+    /// Note a screen clear and the lines it sent toward history, which no scroll records.
+    fn note_clear(&mut self, lines: usize) {
         self.pushed = self.pushed.saturating_add(lines);
+        self.since_clear = Some(0);
     }
 
     /// Record a scroll of `lines` (signed, positive up) within `region`, before the grid
@@ -453,6 +466,9 @@ impl ScrollLedger {
         let whole = region.start == 0 && region.end.0 as usize == grid.screen_lines();
         if lines > 0 && region.start == 0 && (whole || !keep) {
             self.pushed = self.pushed.saturating_add(lines as usize);
+            if let Some(since) = &mut self.since_clear {
+                *since = since.saturating_add(lines as usize);
+            }
         }
         let way = lines.signum() as i8;
         let overlap = region.start < self.region.end && self.region.start < region.end;
@@ -2004,7 +2020,7 @@ impl<T: EventListener> Handler for Term<T> {
                     let old_offset = self.grid.display_offset();
 
                     let pushed = self.grid.clear_viewport();
-                    self.scroll_ledger.note_pushed(pushed);
+                    self.scroll_ledger.note_clear(pushed);
 
                     // Compute number of lines scrolled by clearing the viewport.
                     let lines = self.grid.display_offset().saturating_sub(old_offset);
@@ -2054,6 +2070,7 @@ impl<T: EventListener> Handler for Term<T> {
         self.grid.reset();
         self.inactive_grid.reset();
         self.scroll_ledger.clear();
+        self.scroll_ledger.note_clear(0);
         self.scroll_region = Line(0)..Line(self.screen_lines() as i32);
         self.tabs = TabStops::new(self.columns());
         self.title_stack = Vec::new();
@@ -3807,6 +3824,45 @@ mod tests {
     }
 
     #[test]
+    fn scroll_ledger_counts_what_went_up_after_a_clear() {
+        // A viewer that shows a clear at once still eases the output after it, so it
+        // needs that apart from the clear's own push.
+        let size = TermSize::new(5, 4);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        term.scroll_up(2);
+        assert_eq!(term.scroll_ledger().since_clear(), None);
+
+        term.grid[Line(2)][Column(0)].c = 'x';
+        term.clear_screen(ansi::ClearMode::All);
+        assert_eq!(term.scroll_ledger().pushed(), 5);
+        assert_eq!(term.scroll_ledger().since_clear(), Some(0));
+        term.scroll_up(3);
+        term.set_scrolling_region(1, Some(3));
+        term.scroll_up(1);
+        assert_eq!(term.scroll_ledger().since_clear(), Some(4));
+        assert_eq!(term.scroll_ledger().pushed(), 9);
+
+        // Erasing only the scrollback leaves the screen, so it is no clear.
+        term.clear_screen(ansi::ClearMode::Saved);
+        assert_eq!(term.scroll_ledger().since_clear(), Some(4));
+        // The last clear is the one that counts.
+        term.clear_screen(ansi::ClearMode::All);
+        assert_eq!(term.scroll_ledger().since_clear(), Some(0));
+
+        term.scroll_ledger_mut().drain();
+        assert_eq!(term.scroll_ledger().since_clear(), None);
+        term.reset_state();
+        assert_eq!(term.scroll_ledger().since_clear(), Some(0));
+        term.scroll_ledger_mut().clear();
+        assert_eq!(term.scroll_ledger().since_clear(), None);
+
+        // The alt screen has no history to clear into.
+        term.swap_alt();
+        term.clear_screen(ansi::ClearMode::All);
+        assert_eq!(term.scroll_ledger().since_clear(), None);
+    }
+
+    #[test]
     fn scroll_ledger_takes_a_dropped_row_rather_than_copying_it() {
         let size = TermSize::new(6, 4);
         let mut term = Term::new(Config::default(), &size, VoidListener);
@@ -3929,6 +3985,7 @@ mod tests {
 
             let ledger = big.scroll_ledger();
             assert_eq!(ledger.pushed(), full.scroll_ledger().pushed(), "{at}");
+            assert_eq!(ledger.since_clear(), (op == 4 && !alt).then_some(0), "{at}");
             if !alt {
                 let grew = big.grid().history_size() - history;
                 assert_eq!(ledger.pushed(), grew, "{at}");
